@@ -752,11 +752,30 @@ class ObjectCache2:
                 obj_id,
             )
 
+
     def diff(self, depsgraph):
         only_scene = len(depsgraph.updates) == 1 and isinstance(
             depsgraph.updates[0].id, bpy.types.Scene
         )
-        return depsgraph.id_type_updated("OBJECT") and not only_scene
+        if not depsgraph.id_type_updated("OBJECT") or only_scene:
+            return False
+
+        has_node_tree = any('NodeTree' in type(u.id).__name__ for u in depsgraph.updates)
+        if not has_node_tree:
+            return True
+
+        for dg_update in depsgraph.updates:
+            if 'NodeTree' in type(dg_update.id).__name__:
+                continue
+            if isinstance(dg_update.id, bpy.types.Object):
+                if dg_update.is_updated_geometry or dg_update.is_updated_transform:
+                    return True
+            elif isinstance(dg_update.id, bpy.types.Mesh):
+                if dg_update.is_updated_geometry:
+                    return True
+
+        return False
+
 
     def update(self, exporter, depsgraph, luxcore_scene, scene_props, context):
         is_viewport_render = bool(context)
@@ -866,8 +885,21 @@ class ObjectCache2:
         #  Would be better for performance with many particles, however I'm not sure
         #  we can find all instances corresponding to one particle system?
 
-        # Currently, every update that doesn't require a mesh re-export happens here
+        # Fast path: if only transforms changed and no particles/instances involved,
+        # only update the affected objects directly
+        updated_objects = {
+            dg_update.id 
+            for dg_update in depsgraph.updates 
+            if isinstance(dg_update.id, bpy.types.Object) and dg_update.is_updated_transform
+        }
+
         for dg_obj_instance in depsgraph.object_instances:
+            if not supports_live_transform(dg_obj_instance.particle_system):
+                continue
+            # Skip if this object wasn't updated
+            if dg_obj_instance.object not in updated_objects and not redefine_objs_with_these_mesh_keys:
+                continue
+        
             if not supports_live_transform(dg_obj_instance.particle_system):
                 continue
 
