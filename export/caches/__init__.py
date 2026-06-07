@@ -214,12 +214,14 @@ class WorldCache:
             if self.world_name != world.name_full:
                 world_updated = True
 
+            # The sun influences the world, e.g. through direction and turbidity if sky2 is used
             if world.luxcore.light == "sky2" and depsgraph.id_type_updated("OBJECT"):
                 for dg_update in depsgraph.updates:
                     if dg_update.id == world.luxcore.sun:
                         world_updated = True
                         break
         elif self.world_name:
+            # We had a world, but it was deleted
             world_updated = True
 
         self.world_name = world.name_full if world else None
