@@ -770,6 +770,8 @@ class ObjectCache2:
             if isinstance(dg_update.id, bpy.types.Object):
                 if dg_update.is_updated_geometry or dg_update.is_updated_transform:
                     return True
+                if dg_update.id.type == 'LIGHT':
+                    return True
             elif isinstance(dg_update.id, bpy.types.Mesh):
                 if dg_update.is_updated_geometry:
                     return True
@@ -880,27 +882,44 @@ class ObjectCache2:
                             self.exported_objects[obj_key] = exported_stuff
                             scene_props.Set(props)
 
+            
         # TODO maybe not loop over all instances, instead only loop over updated
         #  objects and check if they have a particle system that needs to be updated?
         #  Would be better for performance with many particles, however I'm not sure
         #  we can find all instances corresponding to one particle system?
 
-        # Fast path: if only transforms changed and no particles/instances involved,
-        # only update the affected objects directly
+        # Collect objects that were updated in this depsgraph pass for fast filtering
         updated_objects = {
-            dg_update.id 
-            for dg_update in depsgraph.updates 
-            if isinstance(dg_update.id, bpy.types.Object) and dg_update.is_updated_transform
+            dg_update.id
+            for dg_update in depsgraph.updates
+            if isinstance(dg_update.id, bpy.types.Object)
         }
+
+        # Light property changes (not transforms) require all instances to be checked
+        # since GN instances don't appear as separate depsgraph updates
+        has_light_property_update = any(
+            isinstance(dg_update.id, bpy.types.Object) and
+            dg_update.id.type == 'LIGHT' and
+            dg_update.is_updated_geometry and
+            not dg_update.is_updated_transform
+            for dg_update in depsgraph.updates
+        )
+
+        # If mesh keys need redefining or a light property changed,
+        # all instances must be checked regardless
+        has_real_mesh_redefine = any(
+            '_instance' not in key for key in redefine_objs_with_these_mesh_keys
+        )
+        must_check_all = has_real_mesh_redefine or has_light_property_update
 
         for dg_obj_instance in depsgraph.object_instances:
             if not supports_live_transform(dg_obj_instance.particle_system):
                 continue
-            # Skip if this object wasn't updated
-            if dg_obj_instance.object not in updated_objects and not redefine_objs_with_these_mesh_keys:
-                continue
-        
-            if not supports_live_transform(dg_obj_instance.particle_system):
+
+            # Skip instances whose object was not part of this update,
+            # unless a mesh redefinition or light property change requires
+            # all instances to be checked
+            if not must_check_all and dg_obj_instance.object not in updated_objects:
                 continue
 
             obj = dg_obj_instance.object
