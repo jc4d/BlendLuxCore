@@ -46,7 +46,14 @@ class CameraCache:
         return has_changes
 
 
+# UI-only node properties that don't affect rendering.
+# These are standard Blender node properties (bpy.types.Node) that represent
+# display state rather than render-relevant values, so we exclude them from
+# the hash to avoid spurious render restarts when moving or selecting nodes.
+# Full list of bpy.types.Node properties:
+# https://docs.blender.org/api/current/bpy.types.Node.html
 IGNORE_PROPS = {
+    # UI/display properties
     'location',
     'location_absolute',
     'width',
@@ -63,20 +70,41 @@ IGNORE_PROPS = {
     'bl_height_default',
     'bl_height_min',
     'bl_height_max',
+    # Node metadata - not render relevant
+    'rna_type',
+    'name',
+    'label',
+    'bl_label',
+    'bl_description',
+    'bl_icon',
+    'bl_static_type',
+    'bl_idname',
+    'color',
+    'color_tag',
+    'warning_propagation',
+    'dimensions',
+    'inputs',
+    'outputs',
+    'internal_links',
+    'parent',
 }
 
 
-def _hash_reachable_nodes(mat):
-    # LuxCore uses its own node tree, not mat.node_tree
-    tree = mat.luxcore.node_tree if hasattr(mat, 'luxcore') and mat.luxcore.node_tree else mat.node_tree
-    if not tree:
-        return None
-
-    # LuxCore output node is LuxCoreNodeMatOutput, Cycles uses OUTPUT_MATERIAL
-    output = next(
-        (n for n in tree.nodes if n.bl_idname in ('LuxCoreNodeMatOutput', 'OUTPUT_MATERIAL')),
-        None
-    )
+def _hash_node_tree(tree, output_idnames):
+    """Hash all render-relevant properties of nodes reachable from the output node.
+    Only nodes connected to the output are traversed, so disconnected nodes
+    do not affect the hash and will not trigger unnecessary render restarts."""
+    output = None
+    for idname in output_idnames:
+        output = next(
+            (n for n in tree.nodes if n.bl_idname == idname and getattr(n, 'is_active_output', False)),
+            None
+        ) or next(
+            (n for n in tree.nodes if n.bl_idname == idname),
+            None
+        )
+        if output:
+            break
     if not output:
         return None
 
@@ -90,27 +118,73 @@ def _hash_reachable_nodes(mat):
         data.append(node.bl_idname)
         for inp in node.inputs:
             if not inp.is_linked and hasattr(inp, 'default_value'):
-                try:
-                    val = tuple(inp.default_value)
-                except TypeError:
-                    val = inp.default_value
+                val = inp.default_value
+                if hasattr(val, '__iter__') and not isinstance(val, str):
+                    val = tuple(val)
                 data.append((inp.name, str(val)))
             for link in inp.links:
                 traverse(link.from_node)
+        # Hash output socket values to capture source nodes like RGB and Value
+        # whose value is stored in outputs rather than inputs
+        for out in node.outputs:
+            if hasattr(out, 'default_value'):
+                val = out.default_value
+                if hasattr(val, '__iter__') and not isinstance(val, str):
+                    val = tuple(val)
+                data.append(('out_' + out.name, str(val)))
         for prop in node.bl_rna.properties:
             if prop.identifier in IGNORE_PROPS:
                 continue
-            # Only hash simple value types, skip structs/pointers/collections
-            # that may come from third party addons and have unstable representations
-            if prop.type not in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
-                continue
-            try:
+            if prop.type in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
                 data.append((prop.identifier, str(getattr(node, prop.identifier))))
-            except Exception:
-                pass
+            elif prop.type == 'POINTER':
+                # Use the name of the pointed-to object as a stable identifier
+                # e.g. for image textures, this captures which image is assigned
+                val = getattr(node, prop.identifier, None)
+                if val is not None and hasattr(val, 'name'):
+                    data.append((prop.identifier, val.name))
 
     traverse(output)
-    return data
+    return hash(tuple(data))
+
+
+def _get_material_hash(mat):
+    # Guard against materials with no LuxCore properties,
+    # e.g. after a material slot is removed
+    if not hasattr(mat, 'luxcore'):
+        return None
+    if mat.luxcore.node_tree and not mat.luxcore.use_cycles_nodes:
+        tree = mat.luxcore.node_tree
+        output_idnames = ['LuxCoreNodeMatOutput']
+    else:
+        tree = mat.node_tree
+        output_idnames = ['ShaderNodeOutputMaterial']
+    if not tree:
+        return None
+    return _hash_node_tree(tree, output_idnames)
+
+
+def _hash_world(world):
+    lux = world.luxcore
+
+    # When using Cycles settings, hash the Cycles world node tree
+    if lux.use_cycles_settings and world.node_tree:
+        return _hash_node_tree(world.node_tree, ['ShaderNodeOutputWorld'])
+
+    # LuxCore native world settings: hash all render-relevant properties
+    data = []
+    for prop in lux.bl_rna.properties:
+        if prop.type in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
+            val = getattr(lux, prop.identifier)
+            if hasattr(val, '__iter__') and not isinstance(val, str):
+                val = tuple(val)
+            data.append((prop.identifier, str(val)))
+        elif prop.type == 'POINTER':
+            # Use the name of the pointed-to object as a stable identifier
+            val = getattr(lux, prop.identifier, None)
+            if val is not None and hasattr(val, 'name'):
+                data.append((prop.identifier, val.name))
+    return hash(tuple(data))
 
 
 class MaterialCache:
@@ -124,15 +198,15 @@ class MaterialCache:
                 if not isinstance(dg_update.id, bpy.types.Material):
                     continue
                 mat = dg_update.id
-                lux_tree = mat.luxcore.node_tree if hasattr(mat, 'luxcore') and mat.luxcore.node_tree else None
-                if lux_tree or mat.node_tree:
-                    new_data = _hash_reachable_nodes(mat)
-                    new_hash = hash(tuple(new_data)) if new_data else None
-                    old_hash = self.material_hashes.get(mat.name + '_hash')
-                    self.material_hashes[mat.name + '_hash'] = new_hash
-                    self.material_hashes[mat.name + '_data'] = new_data
+                if not hasattr(mat, 'luxcore'):
+                    self.changed_materials.add(mat)
+                    continue
+                if mat.luxcore.node_tree or mat.node_tree:
+                    new_hash = _get_material_hash(mat)
+                    old_hash = self.material_hashes.get(mat.name)
                     if old_hash == new_hash:
                         continue
+                    self.material_hashes[mat.name] = new_hash
                 self.changed_materials.add(mat)
         return self.changed_materials
 
@@ -148,7 +222,6 @@ class VisibilityCache:
         # sets containing keys
         self.last_visible_objects = None
         self.objects_to_remove = None
-        
         self.has_new_objects = False
 
     def init(self, depsgraph, context):
@@ -175,24 +248,6 @@ class VisibilityCache:
                     continue
                 keys.add(utils.make_key_from_instance(dg_obj_instance))
         return keys
-
-
-def _hash_world(world):
-    data = []
-    lux = world.luxcore
-    for prop in lux.bl_rna.properties:
-        if prop.type not in ('BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'):
-            continue
-        try:
-            val = getattr(lux, prop.identifier)
-            try:
-                val = tuple(val)
-            except TypeError:
-                pass
-            data.append((prop.identifier, str(val)))
-        except Exception:
-            pass
-    return hash(tuple(data))
 
 
 class WorldCache:
