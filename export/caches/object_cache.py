@@ -184,7 +184,10 @@ def get_material(obj, material_index, depsgraph):
             node_tree is not None
         ):  # happens e.g. in default cube scene when only cycles nodes are defined
             output_node = get_active_output(node_tree)
-            override_exclude = output_node.override_exclude
+            try:
+                override_exclude = output_node.override_exclude
+            except AttributeError:
+                override_exclude = True
 
     if material_override and material is None:
         mat = material_override
